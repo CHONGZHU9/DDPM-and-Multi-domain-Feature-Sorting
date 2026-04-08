@@ -1,0 +1,38 @@
+import numpy as np
+import networkx as nx
+from tqdm import tqdm
+
+mi_matrices = np.load("E:\\EEG\\EEGtest\\MI_Networks\\FNSZ\\fnsz_all_mi_matrices.npy")
+
+def extract_network_metrics(mi_matrix):
+    G = nx.from_numpy_array(mi_matrix)
+
+    node_strength = dict(G.degree(weight='weight'))
+    clustering_coefficient = nx.clustering(G, weight='weight')
+    betweenness_centrality = nx.betweenness_centrality(G, weight='weight')
+
+    local_efficiency = {}
+    for node in G.nodes():
+        subgraph = G.subgraph(G.neighbors(node))
+        if len(subgraph) > 1:
+            local_efficiency[node] = nx.global_efficiency(subgraph)
+        else:
+            local_efficiency[node] = 0.0
+
+    metrics = np.array([
+        [node_strength[i], clustering_coefficient[i], betweenness_centrality[i], local_efficiency[i]]
+        for i in range(19)
+    ])
+
+    return metrics
+
+num_samples = mi_matrices.shape[0]
+all_metrics = np.zeros((num_samples, 19, 4))
+
+for i in tqdm(range(num_samples), desc="Processing samples", unit="sample"):
+    mi_matrix = mi_matrices[i]
+    all_metrics[i] = extract_network_metrics(mi_matrix)
+
+np.save("E:\\EEG\\EEGtest\\MI_Networks\\FNSZ\\fnsz_network_feature_3d.npy", all_metrics)
+
+print("指标提取完成并已保存到 tcsz_network_feature_3d.npy 文件中！")
