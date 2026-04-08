@@ -1,0 +1,364 @@
+import numpy as np
+import pandas as pd
+import tensorflow as tf
+from tensorflow.keras import layers
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import Conv2D, MaxPooling2D, Flatten, Dense, Dropout, GRU
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.metrics import accuracy_score, confusion_matrix, f1_score, balanced_accuracy_score
+import matplotlib.pyplot as plt
+import seaborn as sns
+from tensorflow.keras.optimizers import Adam
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.feature_selection import chi2
+from tensorflow.keras.regularizers import l2
+from tqdm import tqdm
+from tqdm.keras import TqdmCallback
+import shap
+import time
+import random
+
+absz_data = np.load(r"E:\EEG\EEGtest\features\absz_features_combined_network_flattened.npy")
+cpsz_data = np.load(r"E:\EEG\EEGtest\features\cpsz_features_combined_network_flattened.npy")
+fnsz_data = np.load(r"E:\EEG\EEGtest\features\fnsz_features_combined_network_flattened.npy")
+gnsz_data = np.load(r"E:\EEG\EEGtest\features\gnsz_features_combined_network_flattened.npy")
+tcsz_data = np.load(r"E:\EEG\EEGtest\features\spsz_features_combined_network_flattened.npy")
+spsz_data = np.load(r"E:\EEG\EEGtest\features\tcsz_features_combined_network_flattened.npy")
+
+def take_first_half(data):
+    num_samples = data.shape[0]
+    half_size = int(num_samples * 0.5)
+    return data[:half_size]
+
+absz_labels = np.zeros(absz_data.shape[0])
+cpsz_labels = np.ones(cpsz_data.shape[0])
+fnsz_labels = 2 * np.ones(fnsz_data.shape[0])
+gnsz_labels = 3 * np.ones(gnsz_data.shape[0])
+tcsz_labels = 4 * np.ones(tcsz_data.shape[0])
+spsz_labels = 5 * np.ones(spsz_data.shape[0])
+
+X = np.vstack((absz_data, cpsz_data, fnsz_data, gnsz_data, tcsz_data, spsz_data))
+y = np.hstack((absz_labels, cpsz_labels, fnsz_labels, gnsz_labels, tcsz_labels, spsz_labels))
+
+random_state = random.randint(0, 100)
+
+X_train, X_temp, y_train, y_temp = train_test_split(X, y, test_size=0.3, random_state=random_state)
+X_val, X_test, y_val, y_test = train_test_split(X_temp, y_temp, test_size=0.67, random_state=random_state)
+
+scaler = MinMaxScaler()
+X_train_scaled = scaler.fit_transform(X_train)
+X_val_scaled = scaler.transform(X_val)
+X_test_scaled = scaler.transform(X_test)
+
+X_train_scaled_1 = X_train_scaled.reshape(X_train_scaled.shape[0], 1, X_train_scaled.shape[1], 1)
+X_val_scaled_1 = X_val_scaled.reshape(X_val_scaled.shape[0], 1, X_val_scaled.shape[1], 1)
+X_test_scaled_1 = X_test_scaled.reshape(X_test_scaled.shape[0], 1, X_test_scaled.shape[1], 1)
+
+print(X_train_scaled_1.shape, X_val_scaled_1.shape, X_test_scaled_1.shape)
+
+y_train_tensor = y_train.astype(np.int32)
+y_val_tensor = y_val.astype(np.int32)
+y_test_tensor = y_test.astype(np.int32)
+
+rf_model = RandomForestClassifier(n_estimators=150, random_state=random_state)
+rf_model.fit(X_train_scaled.reshape(X_train_scaled.shape[0], -1), y_train_tensor)
+rf_importances = rf_model.feature_importances_
+
+chi2_stat, p_val = chi2(X_train_scaled.reshape(X_train_scaled.shape[0], -1), y_train_tensor)
+chi2_importances = chi2_stat
+
+feature_names = [f"Feature_{i}" for i in range(X_train_scaled_1.shape[2])]
+rf_importance_df = pd.DataFrame({'Feature': feature_names, 'Random Forest Importance': rf_importances})
+chi2_importance_df = pd.DataFrame({'Feature': feature_names, 'Chi-square Importance': chi2_importances})
+
+def build_cnn_model(input_shape):
+    model = Sequential([
+        Conv2D(32, (3, 3), activation='relu', padding='same', input_shape=input_shape),
+        MaxPooling2D((2, 2), padding='same'),
+        Conv2D(64, (3, 3), activation='relu', padding='same'),
+        MaxPooling2D((2, 2), padding='same'),
+        Flatten(),
+        Dense(64, activation='relu'),
+        Dropout(0.5),
+        Dense(6, activation='sigmoid')
+    ])
+    return model
+
+new_cnn_model = build_cnn_model((1, X_train_scaled_1.shape[2], 1))
+
+new_cnn_model.compile(optimizer=Adam(learning_rate=0.001, beta_1=0.9, beta_2=0.999, epsilon=1e-08),
+                      loss='sparse_categorical_crossentropy',
+                      metrics=['accuracy'])
+
+num_summary_samples = 1000
+X_train_summary = shap.kmeans(X_train_scaled_1.reshape(X_train_scaled_1.shape[0], -1), num_summary_samples)
+X_train_summary_reshaped = X_train_summary.data.reshape(num_summary_samples, 1, X_train_scaled_1.shape[2], 1)
+X_train_summary_reshaped = X_train_summary_reshaped.astype(np.float32)
+
+explainer_new_cnn = shap.DeepExplainer(new_cnn_model, X_train_summary_reshaped)
+
+batch_size = 100
+num_samples = X_val_scaled_1.shape[0]
+half_samples = num_samples // 2
+shap_values_new_cnn = []
+
+for i in tqdm(range(0, half_samples, batch_size), desc="Calculating SHAP values", unit="batch"):
+    batch = X_val_scaled[i:i + batch_size].reshape(-1, 1, X_train_scaled_1.shape[2], 1)
+    shap_values_batch = explainer_new_cnn.shap_values(batch)
+    shap_values_batch_mean = np.mean(shap_values_batch, axis=-1)
+    shap_values_new_cnn.extend(shap_values_batch_mean)
+
+shap_values_new_cnn = np.array(shap_values_new_cnn)
+shap_mean_importances_new_cnn = np.abs(shap_values_new_cnn).mean(axis=0).flatten()
+
+shap_importance_df_new_cnn = pd.DataFrame({'Feature': feature_names, 'SHAP Importance (New CNN)': shap_mean_importances_new_cnn})
+
+chi2_importance_df['Chi-square Rank'] = chi2_importance_df['Chi-square Importance'].rank(ascending=False)
+rf_importance_df['Random Forest Rank'] = rf_importance_df['Random Forest Importance'].rank(ascending=False)
+shap_importance_df_new_cnn['SHAP Rank'] = shap_importance_df_new_cnn['SHAP Importance (New CNN)'].rank(ascending=False)
+
+importance_comparison_df = pd.DataFrame({
+    'Feature': feature_names,
+    'Chi-square Rank': chi2_importance_df['Chi-square Rank'].values,
+    'Random Forest Rank': rf_importance_df['Random Forest Rank'].values,
+    'SHAP Rank': shap_importance_df_new_cnn['SHAP Rank'].values
+})
+
+importance_comparison_df['Borda Count Score'] = importance_comparison_df[['Chi-square Rank', 'Random Forest Rank']].sum(axis=1)
+
+print("\nFinal Feature Importance Ranking (Borda Count):")
+print(importance_comparison_df[['Feature', 'Borda Count Score']])
+
+importance_comparison_df['Borda Count Weight'] = (1 - (importance_comparison_df['Borda Count Score'] / importance_comparison_df['Borda Count Score'].sum()) * 10)
+
+print("\nFeature Weights (Borda Count):")
+print(importance_comparison_df[['Feature', 'Borda Count Weight']])
+
+min_weight = importance_comparison_df['Borda Count Weight'].min()
+max_weight = importance_comparison_df['Borda Count Weight'].max()
+importance_comparison_df['Borda Count Weight Normalized'] = (importance_comparison_df['Borda Count Weight'] - min_weight) / (max_weight - min_weight)
+
+borda_weights = importance_comparison_df['Borda Count Weight'].values
+borda_weights_normalized = borda_weights / np.max(borda_weights)
+
+selected_features = importance_comparison_df[importance_comparison_df['Borda Count Weight'] > 0.97]['Feature'].values
+print("\nSelected Features (Borda Count Weight > 0.97):")
+print(selected_features)
+
+selected_weights = importance_comparison_df[importance_comparison_df['Borda Count Weight'] > 0.97]['Borda Count Weight'].values
+selected_weights = selected_weights / np.max(selected_weights)
+
+selected_feature_indices = [feature_names.index(feature) for feature in selected_features]
+X_train_selected = X_train_scaled[:, selected_feature_indices]
+X_val_selected = X_val_scaled[:, selected_feature_indices]
+X_test_selected = X_test_scaled[:, selected_feature_indices]
+
+X_train_selected = X_train_selected.reshape(X_train_selected.shape[0], 1, X_train_selected.shape[1], 1)
+X_val_selected = X_val_selected.reshape(X_val_selected.shape[0], 1, X_val_selected.shape[1], 1)
+X_test_selected = X_test_selected.reshape(X_test_selected.shape[0], 1, X_test_selected.shape[1], 1)
+
+print(X_train_selected.shape, X_val_selected.shape, X_test_selected.shape)
+
+input_shape_cnn = (1, X_train_selected.shape[2], 1)
+input_shape_gru = (X_train_selected.shape[2], 1)
+
+def weighted_loss(y_true, y_pred, borda_weights):
+    y_true = tf.cast(y_true, tf.int32)
+    weights = tf.cast(tf.gather(borda_weights, y_true), tf.float32)
+    loss = tf.keras.losses.sparse_categorical_crossentropy(y_true, y_pred)
+    weighted_loss = loss * weights
+    return tf.reduce_mean(weighted_loss)
+
+class WeightedLayer(tf.keras.layers.Layer):
+    def __init__(self, weight_tensor, **kwargs):
+        super(WeightedLayer, self).__init__(**kwargs)
+        self.weight_tensor = tf.Variable(weight_tensor, name="weights", trainable=True)
+
+    def call(self, inputs):
+        return inputs * self.weight_tensor
+
+def build_parallel_cnn_gru_model(input_shape_cnn, input_shape_gru, borda_weights_normalized):
+    input_layer_cnn = tf.keras.Input(shape=input_shape_cnn)
+    borda_weights_normalized = tf.cast(borda_weights_normalized, dtype=tf.float32)
+
+    weight_cnn = tf.expand_dims(tf.expand_dims(borda_weights_normalized, axis=0), axis=-1)
+    cnn_branch = WeightedLayer(weight_cnn)(input_layer_cnn)
+
+    cnn_branch = layers.Conv2D(64, (3, 3), activation='relu', padding='same')(cnn_branch)
+    cnn_branch = layers.MaxPooling2D((2, 2), padding='same')(cnn_branch)
+    cnn_branch = layers.Conv2D(128, (3, 3), activation='relu', padding='same')(cnn_branch)
+    cnn_branch = layers.MaxPooling2D((2, 2), padding='same')(cnn_branch)
+    cnn_branch = layers.Conv2D(256, (3, 3), activation='relu', padding='same')(cnn_branch)
+    cnn_branch = layers.MaxPooling2D((2, 2), padding='same')(cnn_branch)
+    cnn_branch = layers.Flatten()(cnn_branch)
+
+    input_layer_gru = tf.keras.Input(shape=input_shape_gru)
+
+    weight_gru = tf.expand_dims(borda_weights_normalized, axis=-1)
+    gru_branch = WeightedLayer(weight_gru)(input_layer_gru)
+
+    gru_branch = layers.GRU(16, return_sequences=True)(gru_branch)
+    gru_branch = layers.Dropout(0.2)(gru_branch)
+    gru_branch = layers.GRU(32, return_sequences=True)(gru_branch)
+    gru_branch = layers.Dropout(0.2)(gru_branch)
+    gru_branch = layers.GRU(64, return_sequences=False)(gru_branch)
+
+    bilinear = tf.keras.layers.Lambda(lambda tensors: tf.einsum('bi,bj->bij', tensors[0], tensors[1]))(
+        [cnn_branch, gru_branch]
+    )
+    bilinear = layers.Flatten()(bilinear)
+
+    dense = layers.Dense(128, activation='relu')(bilinear)
+    dropout = layers.Dropout(0.5)(dense)
+    output = layers.Dense(6, activation='softmax')(dropout)
+
+    model = tf.keras.Model(inputs=[input_layer_cnn, input_layer_gru], outputs=output)
+    return model
+
+class TqdmEpochProgress(tf.keras.callbacks.Callback):
+    def __init__(self, epochs):
+        self.epochs = epochs
+        self.progress_bar = tqdm(total=epochs, desc="Training Progress", unit="epoch")
+
+    def on_epoch_end(self, epoch, logs=None):
+        self.progress_bar.set_postfix({
+            "loss": logs.get("loss"),
+            "accuracy": logs.get("accuracy"),
+            "val_loss": logs.get("val_loss"),
+            "val_accuracy": logs.get("val_accuracy"),
+        })
+        self.progress_bar.update(1)
+
+    def on_train_end(self, logs=None):
+        self.progress_bar.close()
+
+model = build_parallel_cnn_gru_model(input_shape_cnn, input_shape_gru, selected_weights)
+
+optimizer = Adam(learning_rate=0.001, beta_1=0.9, beta_2=0.999, epsilon=1e-08)
+
+model.compile(optimizer=optimizer,
+              loss=lambda y_true, y_pred: weighted_loss(y_true, y_pred, selected_weights),
+              metrics=['accuracy'])
+
+print("\n==================================================")
+print("--- 计算效率评估 (Computational Efficiency) ---")
+print("==================================================")
+
+model.summary()
+
+total_params = model.count_params()
+trainable_params = sum([tf.keras.backend.count_params(w) for w in model.trainable_weights])
+non_trainable_params = sum([tf.keras.backend.count_params(w) for w in model.non_trainable_weights])
+
+print(f"\n【模型规模报告】")
+print(f"Total Model Parameters (总参数量)       : {total_params:,}")
+print(f"Trainable Parameters (可训练参数量)     : {trainable_params:,}")
+print(f"Non-trainable Parameters (不可训练参数量): {non_trainable_params:,}")
+print("==================================================\n")
+
+num_epochs = 100
+batch_size = 96
+
+history = model.fit(
+    [X_train_selected, X_train_selected.reshape(X_train_selected.shape[0], X_train_selected.shape[2], 1)],
+    y_train_tensor,
+    epochs=num_epochs,
+    batch_size=batch_size,
+    validation_data=(
+        [X_val_selected, X_val_selected.reshape(X_val_selected.shape[0], X_val_selected.shape[2], 1)],
+        y_val_tensor
+    ),
+    verbose=0,
+    callbacks=[TqdmEpochProgress(num_epochs)]
+)
+
+print(f"Random State: {random_state}")
+
+y_val_pred_probs = []
+for i in tqdm(range(0, len(X_val_selected), 96), desc="Validation", unit="batch"):
+    batch = X_val_selected[i:i+96]
+    y_val_pred_probs.extend(model.predict([batch, batch.reshape(batch.shape[0], batch.shape[2], 1)], verbose=0))
+
+y_val_pred = np.argmax(y_val_pred_probs, axis=1)
+val_accuracy = accuracy_score(y_val_tensor, y_val_pred)
+print("Validation Accuracy:", val_accuracy)
+
+y_test_pred_probs = []
+for i in tqdm(range(0, len(X_test_selected), 96), desc="Testing", unit="batch"):
+    batch = X_test_selected[i:i+96]
+    y_test_pred_probs.extend(model.predict([batch, batch.reshape(batch.shape[0], batch.shape[2], 1)], verbose=0))
+
+y_test_pred = np.argmax(y_test_pred_probs, axis=1)
+test_accuracy = accuracy_score(y_test_tensor, y_test_pred)
+print("Test Accuracy:", test_accuracy)
+
+test_balanced_accuracy = balanced_accuracy_score(y_test_tensor, y_test_pred)
+print("Test Balanced Accuracy:", test_balanced_accuracy)
+
+test_f1 = f1_score(y_test_tensor, y_test_pred, average='weighted')
+print("Test F1 Score:", test_f1)
+
+conf_matrix = confusion_matrix(y_test_tensor, y_test_pred)
+
+labels = ['absz', 'cpsz', 'fnsz', 'gnsz', 'tcsz', 'spsz']
+
+for i, label in enumerate(labels):
+    class_accuracy = conf_matrix[i, i] / conf_matrix[i].sum()
+    print(f"{label} Accuracy: {class_accuracy:.4f}")
+
+plt.figure(figsize=(10, 8))
+sns.heatmap(conf_matrix, annot=True, fmt="d", cmap="Blues", xticklabels=labels, yticklabels=labels)
+plt.xlabel('Predicted Label')
+plt.ylabel('True Label')
+plt.title('Confusion Matrix')
+plt.show()
+
+print("\n==================================================")
+print("--- 实时适用性评估 (Real-time Applicability) ---")
+print("==================================================")
+
+num_latency_samples = min(1000, len(X_test_selected))
+test_subset_cnn = X_test_selected[:num_latency_samples]
+test_subset_gru = test_subset_cnn.reshape(num_latency_samples, test_subset_cnn.shape[2], 1)
+
+print("Warming up the model (预热模型以排除图编译耗时)...")
+_ = model.predict([test_subset_cnn[:1], test_subset_gru[:1]], verbose=0)
+print("Warm-up complete.")
+
+inference_times = []
+
+print(f"Simulating real-time inference for {num_latency_samples} samples...")
+for i in tqdm(range(num_latency_samples), desc="Measuring Latency", unit="sample"):
+    single_sample_cnn = test_subset_cnn[i:i + 1]
+    single_sample_gru = test_subset_gru[i:i + 1]
+
+    start_time = time.perf_counter()
+    _ = model.predict([single_sample_cnn, single_sample_gru], verbose=0)
+    end_time = time.perf_counter()
+
+    inference_times.append(end_time - start_time)
+
+inference_times = np.array(inference_times)
+
+avg_latency_ms = np.mean(inference_times) * 1000
+max_latency_ms = np.max(inference_times) * 1000
+p99_latency_ms = np.percentile(inference_times, 99) * 1000
+throughput = 1.0 / np.mean(inference_times)
+
+print("\n--- 实时性能报告 (Real-time Performance Report) ---")
+print(f"平均单样本推理延迟 (Avg Latency)   : {avg_latency_ms:.2f} ms")
+print(f"最大单样本推理延迟 (Max Latency)   : {max_latency_ms:.2f} ms")
+print(f"99% 分位数延迟 (99th Percentile) : {p99_latency_ms:.2f} ms")
+print(f"模型吞吐量 (Throughput)          : {throughput:.2f} samples/second")
+
+window_length_seconds = 4.0
+avg_latency_seconds = np.mean(inference_times)
+
+print("\n--- 评估结论 ---")
+if avg_latency_seconds < window_length_seconds:
+    print(f"[通过] 模型满足 {window_length_seconds} 秒数据窗口的实时性要求。")
+    print(f"说明：模型处理一个样本仅需 {avg_latency_seconds:.4f} 秒，远快于新数据的产生速度，系统不会发生数据积压。")
+else:
+    print(f"[警告] 模型不满足 {window_length_seconds} 秒数据窗口的实时性要求！")
+    print(f"说明：模型处理一个样本需要 {avg_latency_seconds:.4f} 秒，慢于新数据的产生速度。在实时运行中会导致数据严重积压和延迟。")
