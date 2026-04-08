@@ -1,0 +1,200 @@
+import os
+os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
+import math
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import numpy as np
+from torch.utils.data import DataLoader, TensorDataset
+import matplotlib.pyplot as plt
+
+data_path = "E:\\EEG\\EEGtest\\reshape\\absz_slices_3d.npy"
+
+original_numpy_data = np.load(data_path)
+eeg_data = torch.tensor(original_numpy_data, dtype=torch.float32)
+
+num_samples, num_channels, num_features = eeg_data.shape
+
+global_max = eeg_data.max()
+global_min = eeg_data.min()
+normalized_eeg_data = 2.0 * (eeg_data - global_min) / (global_max - global_min) - 1.0
+
+dataset = TensorDataset(normalized_eeg_data)
+dataloader = DataLoader(dataset, batch_size=32, shuffle=True)
+
+class SinusoidalPositionEmbeddings(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.dim = dim
+
+    def forward(self, time):
+        device = time.device
+        half_dim = self.dim // 2
+        embeddings = math.log(10000) / (half_dim - 1)
+        embeddings = torch.exp(torch.arange(half_dim, device=device) * -embeddings)
+        embeddings = time[:, None] * embeddings[None, :]
+        embeddings = torch.cat((embeddings.sin(), embeddings.cos()), dim=-1)
+        return embeddings
+
+class Conv1DModel(nn.Module):
+    def __init__(self, num_channels, time_emb_dim=128):
+        super().__init__()
+        self.time_mlp = nn.Sequential(
+            SinusoidalPositionEmbeddings(time_emb_dim),
+            nn.Linear(time_emb_dim, time_emb_dim),
+            nn.GELU(),
+            nn.Linear(time_emb_dim, time_emb_dim),
+        )
+        
+        self.conv1 = nn.Conv1d(num_channels, 64, kernel_size=3, padding=1)
+        self.conv2 = nn.Conv1d(64, 128, kernel_size=3, padding=1)
+        self.conv3 = nn.Conv1d(128, num_channels, kernel_size=3, padding=1)
+        
+        self.time_proj1 = nn.Linear(time_emb_dim, 64)
+        self.time_proj2 = nn.Linear(time_emb_dim, 128)
+        
+        self.relu = nn.ReLU()
+
+    def forward(self, x, t):
+        t_emb = self.time_mlp(t)
+        
+        x = self.relu(self.conv1(x))
+        x = x + self.time_proj1(t_emb).unsqueeze(-1)
+        
+        x = self.relu(self.conv2(x))
+        x = x + self.time_proj2(t_emb).unsqueeze(-1)
+        
+        x = self.conv3(x)
+        return x
+
+def extract(a, t, x_shape):
+    batch_size = t.shape[0]
+    out = a.gather(-1, t.cpu())
+    return out.reshape(batch_size, *((1,) * (len(x_shape) - 1))).to(t.device)
+
+class DDPM:
+    def __init__(self, T, beta_start, beta_end, model):
+        self.model = model
+        self.T = T
+        
+        self.betas = torch.linspace(beta_start, beta_end, T)
+        self.alphas = 1. - self.betas
+        self.alphas_cumprod = torch.cumprod(self.alphas, dim=0)
+        self.alphas_cumprod_prev = torch.nn.functional.pad(self.alphas_cumprod[:-1], (1, 0), value=1.0)
+        
+        self.sqrt_recip_alphas = torch.sqrt(1.0 / self.alphas)
+        self.sqrt_alphas_cumprod = torch.sqrt(self.alphas_cumprod)
+        self.sqrt_one_minus_alphas_cumprod = torch.sqrt(1. - self.alphas_cumprod)
+        self.posterior_variance = self.betas * (1. - self.alphas_cumprod_prev) / (1. - self.alphas_cumprod)
+
+    def forward_diffusion(self, x0, t):
+        noise = torch.randn_like(x0)
+        sqrt_alphas_cumprod_t = extract(self.sqrt_alphas_cumprod, t, x0.shape)
+        sqrt_one_minus_alphas_cumprod_t = extract(self.sqrt_one_minus_alphas_cumprod, t, x0.shape)
+        
+        xt = sqrt_alphas_cumprod_t * x0 + sqrt_one_minus_alphas_cumprod_t * noise
+        return xt, noise
+
+    @torch.no_grad()
+    def reverse_diffusion(self, xt, t, t_index):
+        predicted_noise = self.model(xt, t)
+        
+        beta_t = extract(self.betas, t, xt.shape)
+        sqrt_one_minus_alphas_cumprod_t = extract(self.sqrt_one_minus_alphas_cumprod, t, xt.shape)
+        sqrt_recip_alphas_t = extract(self.sqrt_recip_alphas, t, xt.shape)
+        
+        model_mean = sqrt_recip_alphas_t * (xt - beta_t * predicted_noise / sqrt_one_minus_alphas_cumprod_t)
+
+        if t_index == 0:
+            return model_mean
+        else:
+            posterior_variance_t = extract(self.posterior_variance, t, xt.shape)
+            noise = torch.randn_like(xt)
+            return model_mean + torch.sqrt(posterior_variance_t) * noise
+
+    @torch.no_grad()
+    def generate(self, shape, device):
+        self.model.eval()
+        b = shape[0]
+        xt = torch.randn(shape, device=device)
+        
+        for i in reversed(range(0, self.T)):
+            t = torch.full((b,), i, device=device, dtype=torch.long)
+            xt = self.reverse_diffusion(xt, t, i)
+            
+        self.model.train()
+        return xt
+
+def train(ddpm, dataloader, epochs, device):
+    ddpm.model.train()
+    optimizer = optim.Adam(ddpm.model.parameters(), lr=1e-4)
+    criterion = nn.L1Loss()
+
+    for epoch in range(epochs):
+        epoch_loss = 0
+        for batch in dataloader:
+            x0 = batch[0].to(device)
+            t = torch.randint(0, ddpm.T, (x0.shape[0],), device=device).long()
+            
+            xt, true_noise = ddpm.forward_diffusion(x0, t)
+            
+            predicted_noise = ddpm.model(xt, t)
+            
+            loss = criterion(predicted_noise, true_noise)
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            
+            epoch_loss += loss.item()
+            
+        if (epoch + 1) % 50 == 0 or epoch == 0:
+            print(f"Epoch {epoch+1}/{epochs}, Average Loss: {epoch_loss/len(dataloader):.4f}")
+
+    print("模型训练完毕")
+
+if __name__ == '__main__':
+    T = 1000
+    beta_start = 1e-4
+    beta_end = 0.02
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
+    
+    model = Conv1DModel(num_channels=num_channels).to(device)
+    ddpm = DDPM(T, beta_start, beta_end, model)
+
+    train(ddpm, dataloader, epochs=500, device=device)
+
+    print("开始生成数据...")
+    num_samples_to_generate = num_samples
+    batch_size_gen = 32
+    generated_data_list = []
+
+    for i in range(0, num_samples_to_generate, batch_size_gen):
+        batch_shape = (min(batch_size_gen, num_samples_to_generate - i), num_channels, num_features)
+        batch_data = ddpm.generate(batch_shape, device).cpu()
+        generated_data_list.append(batch_data)
+        torch.cuda.empty_cache()
+
+    generated_data = torch.cat(generated_data_list, dim=0)
+
+    scaled_generated_data = (generated_data + 1.0) / 2.0 * (global_max - global_min) + global_min
+
+    base_name = os.path.basename(data_path)
+    file_prefix = os.path.splitext(base_name)[0][:4]
+    output_path = f"E:\\EEG\\EEGtest\\reshape\\{file_prefix}_scaled_generated_data.pt"
+    torch.save(scaled_generated_data, output_path)
+    print(f"生成数据已保存到 {output_path}")
+
+    fig, axs = plt.subplots(2, 1, figsize=(10, 10))
+
+    axs[0].plot(original_numpy_data[0, 0, :], label="Original Sample 1")
+    axs[0].set_title("Original EEG Data (Channel 0)")
+    axs[0].legend()
+
+    axs[1].plot(scaled_generated_data.detach().numpy()[0, 0, :], label="Generated Sample 1")
+    axs[1].set_title("Generated & Rescaled EEG Data (Channel 0)")
+    axs[1].legend()
+
+    plt.tight_layout()
+    plt.show()
